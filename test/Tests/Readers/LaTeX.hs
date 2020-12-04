@@ -157,28 +157,38 @@ tests = [ testGroup "tokenization"
                    ]
           , "Table with multirow item" =:
             T.unlines ["\\begin{tabular}{c}"
-                      ,"\\multirow{2}{c}{One}\\\\Two\\\\"
+                      ,"\\multirow{2}{5em}{One}\\\\Two\\\\"
                       ,"\\end{tabular}"
                       ] =?>
             table' [AlignCenter]
-                  [ Row nullAttr [ cell AlignCenter (RowSpan 2) (ColSpan 1) (plain "One") ]
+                  [ Row nullAttr [ cell AlignDefault (RowSpan 2) (ColSpan 1) (plain "One") ]
+                  , Row nullAttr [ simpleCell (plain "Two") ]
+                  ]
+          , "Table with multirow item using full prototype" =:
+            T.unlines ["\\begin{tabular}{c}"
+                      ,"\\multirow[c]{2}[3]{5em}[1in]{One}\\\\Two\\\\"
+                      ,"\\end{tabular}"
+                      ] =?>
+            table' [AlignCenter]
+                  [ Row nullAttr [ cell AlignDefault (RowSpan 2) (ColSpan 1) (plain "One") ]
                   , Row nullAttr [ simpleCell (plain "Two") ]
                   ]
           , "Table with nested multirow/multicolumn item" =:
-            T.unlines [ "\\begin{tabular}{c c c}"
-                      , "\\multirow{2}{c}{\\multicolumn{2}{c}{One}}&Two\\\\"
-                      , "Three\\\\"
-                      , "Four&Five&Six\\\\"
+            T.unlines [ "\\begin{tabular}{c c c c}"
+                      , "\\multicolumn{3}{c}{\\multirow{2}{5em}{One}}&Two\\\\"
+                      , "\\multicolumn{2}{c}{} & & Three\\\\"
+                      , "Four&Five&Six&Seven\\\\"
                       , "\\end{tabular}"
                       ] =?>
-            table' [AlignCenter, AlignCenter, AlignCenter]
-                   [ Row nullAttr [ cell AlignCenter (RowSpan 2) (ColSpan 2) (plain "One")
+            table' [AlignCenter, AlignCenter, AlignCenter, AlignCenter]
+                   [ Row nullAttr [ cell AlignCenter (RowSpan 2) (ColSpan 3) (plain "One")
                                   , simpleCell (plain "Two")
                                   ]
                    , Row nullAttr [ simpleCell (plain "Three") ]
                    , Row nullAttr [ simpleCell (plain "Four") 
                                   , simpleCell (plain "Five")
                                   , simpleCell (plain "Six")
+                                  , simpleCell (plain "Seven")
                                   ]
                    ]
           , "Table with multicolumn header" =:
@@ -195,6 +205,25 @@ tests = [ testGroup "tokenization"
                                                          ]
                                            ]
                   ]
+                  (TableFoot nullAttr [])
+          , "Table with normal empty cells" =:
+            T.unlines [ "\\begin{tabular}{|r|r|r|}"
+                      , "A &   & B \\\\"
+                      , "  & C &"
+                      , "\\end{tabular}"
+                      ] =?>
+            table emptyCaption
+                  (replicate 3 (AlignRight, ColWidthDefault))
+                  (TableHead nullAttr [])
+                  [TableBody nullAttr 0 []
+                    [Row nullAttr [ simpleCell (plain "A")
+                                  , emptyCell
+                                  , simpleCell (plain "B")
+                                  ]
+                    ,Row nullAttr [ emptyCell
+                                  , simpleCell (plain "C")
+                                  , emptyCell
+                                  ]]]
                   (TableFoot nullAttr [])
           ]
 

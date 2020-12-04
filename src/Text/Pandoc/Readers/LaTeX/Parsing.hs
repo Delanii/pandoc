@@ -1,8 +1,8 @@
 {-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE ScopedTypeVariables   #-}
-{-# LANGUAGE ViewPatterns          #-}
 {- |
    Module      : Text.Pandoc.Readers.LaTeX.Parsing
    Copyright   : Copyright (C) 2006-2020 John MacFarlane
@@ -77,6 +77,7 @@ module Text.Pandoc.Readers.LaTeX.Parsing
   , skipopts
   , rawopt
   , overlaySpecification
+  , getNextNumber
   ) where
 
 import Control.Applicative (many, (<|>))
@@ -122,7 +123,7 @@ data TheoremStyle =
 
 data TheoremSpec =
   TheoremSpec
-    { theoremName    :: Text
+    { theoremName    :: Inlines
     , theoremStyle   :: TheoremStyle
     , theoremSeries  :: Maybe Text
     , theoremSyncTo  :: Maybe Text
@@ -484,7 +485,11 @@ doMacros' n inp =
            Nothing -> mzero
            Just (Macro expansionPoint argspecs optarg newtoks) -> do
              let getargs' = do
-                   args <- case optarg of
+                   args <-
+                     (case expansionPoint of
+                        ExpandWhenUsed    -> withVerbatimMode
+                        ExpandWhenDefined -> id)
+                     $ case optarg of
                              Nothing -> getargs M.empty argspecs
                              Just o  -> do
                                 x <- option o bracketedToks
@@ -736,14 +741,14 @@ keyval = try $ do
              (mconcat <$> many1 (
                  (untokenize . snd <$> withRaw braced)
                  <|>
-                 (untokenize <$> (many1
+                 (untokenize <$> many1
                       (satisfyTok
-                         (\t -> case t of
+                         (\case
                                 Tok _ Symbol "]" -> False
                                 Tok _ Symbol "," -> False
                                 Tok _ Symbol "{" -> False
                                 Tok _ Symbol "}" -> False
-                                _                -> True))))))
+                                _                -> True)))))
   optional (symbol ',')
   sp
   return (key, T.strip val)
@@ -756,8 +761,7 @@ verbEnv name = withVerbatimMode $ do
   optional blankline
   res <- manyTill anyTok (end_ name)
   return $ stripTrailingNewline
-         $ untokenize
-         $ res
+         $ untokenize res
 
 -- Strip single final newline and any spaces following it.
 -- Input is unchanged if it doesn't end with newline +
@@ -819,8 +823,7 @@ overlaySpecification = try $ do
 
 overlayTok :: PandocMonad m => LP m Tok
 overlayTok =
-  satisfyTok (\t ->
-                  case t of
+  satisfyTok (\case
                     Tok _ Word _       -> True
                     Tok _ Spaces _     -> True
                     Tok _ Symbol c     -> c `elem` ["-","+","@","|",":",","]
@@ -845,4 +848,29 @@ isFontSizeCommand "LARGE" = True
 isFontSizeCommand "huge" = True
 isFontSizeCommand "Huge" = True
 isFontSizeCommand _ = False
+
+getNextNumber :: Monad m
+              => (LaTeXState -> DottedNum) -> LP m DottedNum
+getNextNumber getCurrentNum = do
+  st <- getState
+  let chapnum =
+        case sLastHeaderNum st of
+             DottedNum (n:_) | sHasChapters st -> Just n
+             _                                 -> Nothing
+  return . DottedNum $
+    case getCurrentNum st of
+       DottedNum [m,n]  ->
+         case chapnum of
+              Just m' | m' == m   -> [m, n+1]
+                      | otherwise -> [m', 1]
+              Nothing             -> [1]
+                                      -- shouldn't happen
+       DottedNum [n]   ->
+         case chapnum of
+              Just m  -> [m, 1]
+              Nothing -> [n + 1]
+       _               ->
+         case chapnum of
+               Just n  -> [n, 1]
+               Nothing -> [1]
 

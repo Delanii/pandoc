@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE TupleSections       #-}
 {-# LANGUAGE PatternGuards       #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
@@ -71,7 +72,7 @@ data WriterState =
               , stBeamer        :: Bool          -- produce beamer
               , stEmptyLine     :: Bool          -- true if no content on line
               , stHasCslRefs    :: Bool          -- has a Div with class refs
-              , stCslHangingIndent :: Bool       -- use hanging indent for bib
+              , stIsFirstInDefinition :: Bool    -- first block in a defn list
               }
 
 startingState :: WriterOptions -> WriterState
@@ -102,7 +103,7 @@ startingState options = WriterState {
                 , stBeamer = False
                 , stEmptyLine = True
                 , stHasCslRefs = False
-                , stCslHangingIndent = False }
+                , stIsFirstInDefinition = False }
 
 -- | Convert Pandoc to LaTeX.
 writeLaTeX :: PandocMonad m => WriterOptions -> Pandoc -> m Text
@@ -241,7 +242,6 @@ pandocToLaTeX options (Pandoc meta blocks) = do
                      else defField "dir" ("ltr" :: Text)) $
                   defField "section-titles" True $
                   defField "csl-refs" (stHasCslRefs st) $
-                  defField "csl-hanging-indent" (stCslHangingIndent st) $
                   defField "geometry" geometryFromMargins $
                   (case T.uncons . render Nothing <$>
                         getField "papersize" metadata of
@@ -539,16 +539,23 @@ blockToLaTeX (Div (identifier,classes,kvs) bs) = do
      then modify $ \st -> st{ stIncremental = True }
      else when (beamer && "nonincremental" `elem` classes) $
              modify $ \st -> st { stIncremental = False }
-  result <- if identifier == "refs"
+  result <- if identifier == "refs" || -- <- for backwards compatibility
+               "csl-bib-body" `elem` classes
                then do
+                 modify $ \st -> st{ stHasCslRefs = True }
                  inner <- blockListToLaTeX bs
-                 modify $ \st -> st{ stHasCslRefs = True
-                                   , stCslHangingIndent =
-                                      "hanging-indent" `elem` classes }
-                 return $ "\\begin{cslreferences}" $$
-                          inner $$
-                          "\\end{cslreferences}"
-               else blockListToLaTeX bs
+                 return $ "\\begin{CSLReferences}" <>
+                          (if "hanging-indent" `elem` classes
+                              then braces "1"
+                              else braces "0") <>
+                          (case lookup "entry-spacing" kvs of
+                             Nothing -> braces "0"
+                             Just s  -> braces (literal s))
+                          $$ inner
+                          $+$ "\\end{CSLReferences}"
+               else if "csl-entry" `elem` classes
+                       then vcat <$> mapM cslEntryToLaTeX bs
+                       else blockListToLaTeX bs
   modify $ \st -> st{ stIncremental = oldIncremental }
   linkAnchor' <- hypertarget True identifier empty
   -- see #2704 for the motivation for adding \leavevmode:
@@ -629,6 +636,8 @@ blockToLaTeX (CodeBlock (identifier,classes,keyvalAttr) str) = do
   let listingsCodeBlock = do
         st <- get
         ref <- toLabel identifier
+        kvs <- mapM (\(k,v) -> (k,) <$>
+                       stringToLaTeX TextString v) keyvalAttr
         let params = if writerListings (stOptions st)
                      then (case getListingsLanguage classes of
                                 Just l  -> [ "language=" <> mbBraced l ]
@@ -639,7 +648,7 @@ blockToLaTeX (CodeBlock (identifier,classes,keyvalAttr) str) = do
                           [ (if key == "startFrom"
                                 then "firstnumber"
                                 else key) <> "=" <> mbBraced attr |
-                                (key,attr) <- keyvalAttr,
+                                (key,attr) <- kvs,
                                 key `notElem` ["exports", "tangle", "results"]
                                 -- see #4889
                           ] ++
@@ -682,19 +691,25 @@ blockToLaTeX b@(RawBlock f x) = do
 blockToLaTeX (BulletList []) = return empty  -- otherwise latex error
 blockToLaTeX (BulletList lst) = do
   incremental <- gets stIncremental
+  isFirstInDefinition <- gets stIsFirstInDefinition
   beamer <- gets stBeamer
   let inc = if beamer && incremental then "[<+->]" else ""
   items <- mapM listItemToLaTeX lst
   let spacing = if isTightList lst
                    then text "\\tightlist"
                    else empty
-  return $ text ("\\begin{itemize}" <> inc) $$ spacing $$ vcat items $$
+  return $ text ("\\begin{itemize}" <> inc) $$
+             spacing $$
+             -- force list at beginning of definition to start on new line
+             (if isFirstInDefinition then "\\item[]" else mempty) $$
+             vcat items $$
              "\\end{itemize}"
 blockToLaTeX (OrderedList _ []) = return empty -- otherwise latex error
 blockToLaTeX (OrderedList (start, numstyle, numdelim) lst) = do
   st <- get
   let inc = if stBeamer st && stIncremental st then "[<+->]" else ""
   let oldlevel = stOLLevel st
+  isFirstInDefinition <- gets stIsFirstInDefinition
   put $ st {stOLLevel = oldlevel + 1}
   items <- mapM listItemToLaTeX lst
   modify (\s -> s {stOLLevel = oldlevel})
@@ -738,6 +753,8 @@ blockToLaTeX (OrderedList (start, numstyle, numdelim) lst) = do
          $$ stylecommand
          $$ resetcounter
          $$ spacing
+         -- force list at beginning of definition to start on new line
+         $$ (if isFirstInDefinition then "\\item[]" else mempty)
          $$ vcat items
          $$ "\\end{enumerate}"
 blockToLaTeX (DefinitionList []) = return empty
@@ -761,8 +778,17 @@ blockToLaTeX (Header level (id',classes,_) lst) = do
   return hdr
 blockToLaTeX (Table _ blkCapt specs thead tbody tfoot) = do
   let (caption, aligns, widths, heads, rows) = toLegacyTable blkCapt specs thead tbody tfoot
+  -- simple tables have to have simple cells:
+  let isSimple [Plain _] = True
+      isSimple [Para  _] = True
+      isSimple []        = True
+      isSimple _         = False
+  let widths' = if all (== 0) widths && not (all (all isSimple) rows)
+                   then replicate (length aligns)
+                          (1 / fromIntegral (length aligns))
+                   else widths
   (captionText, captForLof, captNotes) <- getCaption False caption
-  let toHeaders hs = do contents <- tableRowToLaTeX True aligns widths hs
+  let toHeaders hs = do contents <- tableRowToLaTeX True aligns hs
                         return ("\\toprule" $$ contents $$ "\\midrule")
   let removeNote (Note _) = Span ("", [], []) []
       removeNote x        = x
@@ -779,8 +805,12 @@ blockToLaTeX (Table _ blkCapt specs thead tbody tfoot) = do
                 then empty
                 else "\\caption" <> captForLof <> braces captionText
                          <> "\\tabularnewline"
-  rows' <- mapM (tableRowToLaTeX False aligns widths) rows
-  let colDescriptors = literal $ T.concat $ map toColDescriptor aligns
+  rows' <- mapM (tableRowToLaTeX False aligns) rows
+  let colDescriptors =
+         (if all (== 0) widths'
+             then hcat . map literal
+             else (\xs -> cr <> nest 2 (vcat $ map literal xs))) $
+         zipWith (toColDescriptor (length widths')) aligns widths'
   modify $ \s -> s{ stTable = True }
   notes <- notesToLaTeX <$> gets stNotes
   return $ "\\begin{longtable}[]" <>
@@ -815,13 +845,26 @@ getCaption externalNotes txt = do
                    else return empty
   return (capt, captForLof, footnotes)
 
-toColDescriptor :: Alignment -> Text
-toColDescriptor align =
+toColDescriptor :: Int -> Alignment -> Double -> Text
+toColDescriptor _numcols align 0 =
   case align of
          AlignLeft    -> "l"
          AlignRight   -> "r"
          AlignCenter  -> "c"
          AlignDefault -> "l"
+toColDescriptor numcols align width =
+  T.pack $ printf
+     ">{%s\\arraybackslash}p{(\\columnwidth - %d\\tabcolsep) * \\real{%0.2f}}"
+     align'
+     ((numcols - 1) * 2)
+     width
+ where
+   align' :: String
+   align' = case align of
+              AlignLeft    -> "\\raggedright"
+              AlignRight   -> "\\raggedleft"
+              AlignCenter  -> "\\centering"
+              AlignDefault -> "\\raggedright"
 
 blockListToLaTeX :: PandocMonad m => [Block] -> LW m (Doc Text)
 blockListToLaTeX lst =
@@ -830,24 +873,11 @@ blockListToLaTeX lst =
 tableRowToLaTeX :: PandocMonad m
                 => Bool
                 -> [Alignment]
-                -> [Double]
                 -> [[Block]]
                 -> LW m (Doc Text)
-tableRowToLaTeX header aligns widths cols = do
-  -- scale factor compensates for extra space between columns
-  -- so the whole table isn't larger than columnwidth
-  let scaleFactor = 0.97 ** fromIntegral (length aligns)
-  let isSimple [Plain _] = True
-      isSimple [Para  _] = True
-      isSimple []        = True
-      isSimple _         = False
-  -- simple tables have to have simple cells:
-  let widths' = if all (== 0) widths && not (all isSimple cols)
-                   then replicate (length aligns)
-                          (scaleFactor / fromIntegral (length aligns))
-                   else map (scaleFactor *) widths
-  cells <- mapM (tableCellToLaTeX header) $ zip3 widths' aligns cols
-  return $ hsep (intersperse "&" cells) <> "\\tabularnewline"
+tableRowToLaTeX header aligns cols = do
+  cells <- mapM (tableCellToLaTeX header) $ zip aligns cols
+  return $ hsep (intersperse "&" cells) <> " \\\\ \\addlinespace"
 
 -- For simple latex tables (without minipages or parboxes),
 -- we need to go to some lengths to get line breaks working:
@@ -873,31 +903,40 @@ displayMathToInline :: Inline -> Inline
 displayMathToInline (Math DisplayMath x) = Math InlineMath x
 displayMathToInline x                    = x
 
-tableCellToLaTeX :: PandocMonad m => Bool -> (Double, Alignment, [Block])
+tableCellToLaTeX :: PandocMonad m
+                 => Bool -> (Alignment, [Block])
                  -> LW m (Doc Text)
-tableCellToLaTeX _      (0,     _,     blocks) =
-  blockListToLaTeX $ walk fixLineBreaks $ walk displayMathToInline blocks
-tableCellToLaTeX header (width, align, blocks) = do
+tableCellToLaTeX header (align, blocks) = do
   beamer <- gets stBeamer
   externalNotes <- gets stExternalNotes
   inMinipage <- gets stInMinipage
   -- See #5367 -- footnotehyper/footnote don't work in beamer,
   -- so we need to produce the notes outside the table...
-  modify $ \st -> st{ stExternalNotes = beamer,
-                      stInMinipage = True }
-  cellContents <- blockListToLaTeX blocks
-  modify $ \st -> st{ stExternalNotes = externalNotes,
-                      stInMinipage = inMinipage }
-  let valign = text $ if header then "[b]" else "[t]"
-  let halign = case align of
-               AlignLeft    -> "\\raggedright"
-               AlignRight   -> "\\raggedleft"
-               AlignCenter  -> "\\centering"
-               AlignDefault -> "\\raggedright"
-  return $ "\\begin{minipage}" <> valign <>
-           braces (text (printf "%.2f\\columnwidth" width)) <>
-           halign <> cr <> cellContents <> "\\strut" <> cr <>
-           "\\end{minipage}"
+  modify $ \st -> st{ stExternalNotes = beamer }
+  let isPlainOrPara Para{}  = True
+      isPlainOrPara Plain{} = True
+      isPlainOrPara _       = False
+  result <-
+    if all isPlainOrPara blocks
+       then
+         blockListToLaTeX $ walk fixLineBreaks $ walk displayMathToInline blocks
+       else do
+         modify $ \st -> st{ stInMinipage = True }
+         cellContents <- blockListToLaTeX blocks
+         modify $ \st -> st{ stInMinipage = inMinipage }
+         let valign = text $ if header then "[b]" else "[t]"
+         let halign = case align of
+                      AlignLeft    -> "\\raggedright"
+                      AlignRight   -> "\\raggedleft"
+                      AlignCenter  -> "\\centering"
+                      AlignDefault -> "\\raggedright"
+         return $ "\\begin{minipage}" <> valign <>
+                  braces "\\linewidth" <> halign <> cr <>
+                  cellContents <> cr <>
+                  "\\end{minipage}"
+  modify $ \st -> st{ stExternalNotes = externalNotes }
+  return result
+
 
 notesToLaTeX :: [Doc Text] -> Doc Text
 notesToLaTeX [] = empty
@@ -948,7 +987,14 @@ defListItemToLaTeX (term, defs) = do
     let term'' = if any isInternalLink term
                     then braces term'
                     else term'
-    def'  <- liftM vsep $ mapM blockListToLaTeX defs
+    def'  <- case concat defs of
+               [] -> return mempty
+               (x:xs) -> do
+                 modify $ \s -> s{stIsFirstInDefinition = True }
+                 firstitem <- blockToLaTeX x
+                 modify $ \s -> s{stIsFirstInDefinition = False }
+                 rest <- blockListToLaTeX xs
+                 return $ firstitem $+$ rest
     return $ case defs of
      ((Header{} : _) : _)    ->
        "\\item" <> brackets term'' <> " ~ " $$ def'
@@ -1049,7 +1095,7 @@ wrapDiv (_,classes,kvs) t = do
                            let valign = maybe "T" mapAlignment (lookup "align" kvs)
                                totalwidth = maybe [] (\x -> ["totalwidth=" <> x])
                                  (lookup "totalwidth" kvs)
-                               onlytextwidth = filter ((==) "onlytextwidth") classes
+                               onlytextwidth = filter ("onlytextwidth" ==) classes
                                options = text $ T.unpack $ T.intercalate "," $
                                  valign : totalwidth ++ onlytextwidth 
                            in inCmd "begin" "columns" <> brackets options
@@ -1133,6 +1179,23 @@ inlineListToLaTeX lst = hcat <$>
 isQuoted :: Inline -> Bool
 isQuoted (Quoted _ _) = True
 isQuoted _            = False
+
+cslEntryToLaTeX :: PandocMonad m
+                => Block
+                -> LW m (Doc Text)
+cslEntryToLaTeX (Para xs) =
+  mconcat <$> mapM go xs
+ where
+   go (Span ("",["csl-block"],[]) ils) =
+     (cr <>) . inCmd "CSLBlock" <$> inlineListToLaTeX ils
+   go (Span ("",["csl-left-margin"],[]) ils) =
+     inCmd "CSLLeftMargin" <$> inlineListToLaTeX ils
+   go (Span ("",["csl-right-inline"],[]) ils) =
+     (cr <>) . inCmd "CSLRightInline" <$> inlineListToLaTeX ils
+   go (Span ("",["csl-indent"],[]) ils) =
+     (cr <>) . inCmd "CSLIndent" <$> inlineListToLaTeX ils
+   go il = inlineToLaTeX il
+cslEntryToLaTeX x = blockToLaTeX x
 
 -- | Convert inline element to LaTeX
 inlineToLaTeX :: PandocMonad m
@@ -1458,8 +1521,8 @@ citeArgumentsList (CiteGroup _ _ []) = return empty
 citeArgumentsList (CiteGroup pfxs sfxs ids) = do
       pdoc <- inlineListToLaTeX pfxs
       sdoc <- inlineListToLaTeX sfxs'
-      return $ (optargs pdoc sdoc) <>
-              (braces (literal (T.intercalate "," (reverse ids))))
+      return $ optargs pdoc sdoc <>
+              braces (literal (T.intercalate "," (reverse ids)))
       where sfxs' = stripLocatorBraces $ case sfxs of
                 (Str t : r) -> case T.uncons t of
                   Just (x, xs)
@@ -1516,12 +1579,12 @@ citationsToBiblatex (c:cs)
 
       groups <- mapM citeArgumentsList (reverse (foldl' grouper [] (c:cs)))
 
-      return $ text cmd <> (mconcat groups)
+      return $ text cmd <> mconcat groups
 
   where grouper prev cit = case prev of
          ((CiteGroup oPfx oSfx ids):rest)
-             | null oSfx && null pfx -> (CiteGroup oPfx sfx (cid:ids)):rest
-         _ -> (CiteGroup pfx sfx [cid]):prev
+             | null oSfx && null pfx -> CiteGroup oPfx sfx (cid:ids) : rest
+         _ -> CiteGroup pfx sfx [cid] : prev
          where pfx = citationPrefix cit
                sfx = citationSuffix cit
                cid = citationId cit
@@ -1597,6 +1660,7 @@ toPolyglossia (Lang "grc" _ _ _)          = ("greek",   "variant=ancient")
 toPolyglossia (Lang "hsb" _ _  _)         = ("usorbian", "")
 toPolyglossia (Lang "la" _ _ vars)
   | "x-classic" `elem` vars               = ("latin", "variant=classic")
+toPolyglossia (Lang "pt" _ "BR" _)        = ("portuguese", "variant=brazilian")
 toPolyglossia (Lang "sl" _ _ _)           = ("slovenian", "")
 toPolyglossia x                           = (commonFromBcp47 x, "")
 
@@ -1631,6 +1695,7 @@ toBabel (Lang "grc" _ _ _)              = "polutonikogreek"
 toBabel (Lang "hsb" _ _ _)              = "uppersorbian"
 toBabel (Lang "la" _ _ vars)
   | "x-classic" `elem` vars             = "classiclatin"
+toBabel (Lang "pt" _ "BR" _)            = "brazilian"
 toBabel (Lang "sl" _ _ _)               = "slovene"
 toBabel x                               = commonFromBcp47 x
 
@@ -1638,9 +1703,6 @@ toBabel x                               = commonFromBcp47 x
 -- and converts it to a string shared by Babel and Polyglossia.
 -- https://tools.ietf.org/html/bcp47#section-2.1
 commonFromBcp47 :: Lang -> Text
-commonFromBcp47 (Lang "pt" _ "BR" _)            = "brazil"
--- Note: documentation says "brazilian" works too, but it doesn't seem to work
--- on some systems.  See #2953.
 commonFromBcp47 (Lang "sr" "Cyrl" _ _)          = "serbianc"
 commonFromBcp47 (Lang "zh" "Latn" _ vars)
   | "pinyin" `elem` vars                        = "pinyin"

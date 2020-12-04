@@ -267,7 +267,7 @@ table = try $ do
   let rowsPadded = map (pad size) rows'
   let headerPadded = if null tableHeader then mempty else pad size tableHeader
   let toRow = Row nullAttr . map B.simpleCell
-      toHeaderRow l = if null l then [] else [toRow l]
+      toHeaderRow l = [toRow l | not (null l)]
   return $ B.table B.emptyCaption
                     (zip aligns (replicate ncolumns ColWidthDefault))
                       (TableHead nullAttr $ toHeaderRow headerPadded)
@@ -464,7 +464,7 @@ macro = try $ do
   name <- string "%%" *> oneOfStringsCI (map fst commands)
   optional (try $ enclosed (char '(') (char ')') anyChar)
   lookAhead (spaceChar <|> oneOf specialChars <|> newline)
-  maybe (return mempty) (\f -> B.str <$> asks f) (lookup name commands)
+  maybe (return mempty) (\f -> asks (B.str . f)) (lookup name commands)
   where
     commands = [ ("date", date), ("mtime", mtime)
                , ("infile", T.pack . infile), ("outfile", T.pack . outfile)]
